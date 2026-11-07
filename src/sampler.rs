@@ -179,7 +179,10 @@ impl Sampler {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
+            // `nothing()` still enumerates every thread as its own entry; we
+            // only show processes, so skip the per-thread /proc walk.
             ProcessRefreshKind::nothing()
+                .without_tasks()
                 .with_cpu()
                 .with_memory()
                 .with_disk_usage()
