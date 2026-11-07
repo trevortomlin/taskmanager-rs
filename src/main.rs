@@ -1,11 +1,15 @@
 mod app;
+mod bench;
 mod format;
 mod graph;
 mod performance;
+mod process_control;
+mod process_row;
 mod processes;
 mod sampler;
 mod text_input;
 mod theme;
+mod ui;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 

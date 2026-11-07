@@ -1,22 +1,23 @@
 //! The Processes tab: a searchable, sortable, virtualized process table with a
 //! right-click menu for ending processes.
 
-use std::{cmp::Ordering, ops::Range};
+use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
-    Stateful, UniformListScrollHandle, Window, anchored, canvas, deferred, div, point, prelude::*,
-    px, uniform_list,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollStrategy, SharedString, Stateful,
+    UniformListScrollHandle, Window, anchored, canvas, deferred, div, point, prelude::*, px,
+    uniform_list,
 };
-use rustix::{io::Errno, process::Signal};
 
 use crate::{
     app::{TaskManager, ToastKind},
-    format,
+    process_control::{SignalError, SignalKind, signal_process},
+    process_row::RowCells,
     sampler::ProcessRow,
     text_input::TextInput,
-    theme::{heat, theme},
+    theme::theme,
+    ui::empty_state,
 };
 
 const ROW_HEIGHT: Pixels = px(30.);
@@ -37,7 +38,7 @@ pub enum Column {
 }
 
 impl Column {
-    const ALL: [Column; 6] = [
+    pub const ALL: [Column; 6] = [
         Column::Name,
         Column::Pid,
         Column::User,
@@ -69,12 +70,24 @@ impl Column {
         !matches!(self, Column::Name | Column::User)
     }
 
-    fn width(self) -> Option<Pixels> {
+    pub const NAME_MIN_WIDTH: Pixels = px(120.);
+
+    /// Width of every column except Name, which takes the remaining space.
+    pub fn fixed_width(self) -> Option<Pixels> {
         match self {
             Column::Name => None,
             Column::Pid => Some(PID_COL_WIDTH),
             Column::User => Some(USER_COL_WIDTH),
             Column::Cpu | Column::Memory | Column::Disk => Some(NUMERIC_COL_WIDTH),
+        }
+    }
+
+    /// Sizes a header cell; rows use [`crate::process_row::column_spans`], which
+    /// computes the same layout.
+    fn size<E: Styled>(self, el: E) -> E {
+        match self.fixed_width() {
+            Some(width) => el.w(width).flex_shrink_0(),
+            None => el.flex_1().min_w(Self::NAME_MIN_WIDTH),
         }
     }
 }
@@ -94,18 +107,20 @@ impl SortDirection {
     }
 }
 
-/// Sorts rows in place. Ties fall back to PID so rows don't jitter between refreshes.
-pub fn sort_rows(rows: &mut [ProcessRow], column: Column, direction: SortDirection) {
-    rows.sort_by(|a, b| {
+/// Sorts `order` (indices into `rows`). Ties fall back to PID so rows don't
+/// jitter between refreshes.
+pub fn sort_rows(rows: &[ProcessRow], order: &mut [usize], column: Column, dir: SortDirection) {
+    order.sort_unstable_by(|&a, &b| {
+        let (a, b) = (&rows[a], &rows[b]);
         let primary = match column {
-            Column::Name => cmp_text(&a.name, &b.name),
+            Column::Name => a.display.name_lower.cmp(&b.display.name_lower),
             Column::Pid => a.pid.cmp(&b.pid),
-            Column::User => cmp_text(&a.user, &b.user),
+            Column::User => a.display.user_lower.cmp(&b.display.user_lower),
             Column::Cpu => a.cpu.total_cmp(&b.cpu),
             Column::Memory => a.memory.cmp(&b.memory),
             Column::Disk => a.disk.cmp(&b.disk),
         };
-        let primary = match direction {
+        let primary = match dir {
             SortDirection::Ascending => primary,
             SortDirection::Descending => primary.reverse(),
         };
@@ -113,33 +128,39 @@ pub fn sort_rows(rows: &mut [ProcessRow], column: Column, direction: SortDirecti
     });
 }
 
-fn cmp_text(a: &str, b: &str) -> Ordering {
-    a.chars()
-        .flat_map(char::to_lowercase)
-        .cmp(b.chars().flat_map(char::to_lowercase))
+/// A search query, normalized once rather than per row.
+pub struct Query {
+    lower: String,
+    numeric: bool,
 }
 
-/// Case-insensitive match on name or user, or a PID prefix for numeric queries.
-pub fn matches_query(row: &ProcessRow, query: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
+impl Query {
+    pub fn new(text: &str) -> Self {
+        let lower = text.trim().to_lowercase();
+        let numeric = !lower.is_empty() && lower.bytes().all(|b| b.is_ascii_digit());
+        Self { lower, numeric }
     }
-    let query = query.to_lowercase();
-    row.name.to_lowercase().contains(&query)
-        || row.user.to_lowercase().contains(&query)
-        || (query.bytes().all(|b| b.is_ascii_digit()) && row.pid.to_string().starts_with(&query))
+
+    /// Case-insensitive match on name or user, or a PID prefix for numeric queries.
+    pub fn matches(&self, row: &ProcessRow) -> bool {
+        self.lower.is_empty()
+            || row.display.name_lower.contains(&self.lower)
+            || row.display.user_lower.contains(&self.lower)
+            || (self.numeric && row.display.pid.starts_with(&self.lower))
+    }
 }
 
 pub struct ContextMenu {
     pid: u32,
+    start_time: u64,
     name: SharedString,
+    user: SharedString,
     position: Point<Pixels>,
 }
 
 pub struct ProcessesState {
-    /// Processes from the latest snapshot that match the search, sorted for display.
-    pub rows: Vec<ProcessRow>,
+    /// Indices into the snapshot's processes that match the search, in display order.
+    pub rows: Vec<usize>,
     sort_column: Column,
     sort_direction: SortDirection,
     pub search: Entity<TextInput>,
@@ -172,20 +193,36 @@ impl TaskManager {
             return;
         };
         let state = &mut self.processes;
-        let query = state.search.read(cx).text().to_owned();
-        state.rows = snapshot
-            .processes
-            .iter()
-            .filter(|row| matches_query(row, &query))
-            .cloned()
-            .collect();
-        sort_rows(&mut state.rows, state.sort_column, state.sort_direction);
+        let query = Query::new(state.search.read(cx).text());
+        state.rows.clear();
+        state.rows.extend(
+            snapshot
+                .processes
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| query.matches(row))
+                .map(|(ix, _)| ix),
+        );
+        sort_rows(
+            &snapshot.processes,
+            &mut state.rows,
+            state.sort_column,
+            state.sort_direction,
+        );
         // Never leave an invisible process selected: Delete would act on it.
-        if let Some(pid) = state.selected_pid
-            && !state.rows.iter().any(|r| r.pid == pid)
-        {
-            state.selected_pid = None;
+        if state.selected_pid.is_some() && self.selected_row().is_none() {
+            self.processes.selected_pid = None;
         }
+    }
+
+    fn visible_rows(&self) -> impl Iterator<Item = &ProcessRow> {
+        let processes = self.snapshot.as_ref().map_or(&[][..], |s| &s.processes);
+        self.processes.rows.iter().map(move |&ix| &processes[ix])
+    }
+
+    fn selected_row(&self) -> Option<&ProcessRow> {
+        let pid = self.processes.selected_pid?;
+        self.visible_rows().find(|r| r.pid == pid)
     }
 
     fn sort_by(&mut self, column: Column, cx: &mut Context<Self>) {
@@ -196,74 +233,69 @@ impl TaskManager {
             state.sort_column = column;
             state.sort_direction = column.default_direction();
         }
-        sort_rows(&mut state.rows, state.sort_column, state.sort_direction);
+        self.rebuild_rows(cx);
         cx.notify();
     }
 
     /// Moves the selection by `delta` rows and keeps it in view.
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let state = &mut self.processes;
-        if state.rows.is_empty() {
+        let len = self.processes.rows.len();
+        if len == 0 {
             return;
         }
-        let current = state
-            .selected_pid
-            .and_then(|pid| state.rows.iter().position(|r| r.pid == pid));
-        let next = match current {
-            Some(ix) => ix.saturating_add_signed(delta).min(state.rows.len() - 1),
+        let next = match self.processes.selected_pid {
+            Some(pid) => self
+                .visible_rows()
+                .position(|r| r.pid == pid)
+                .map_or(0, |ix| ix.saturating_add_signed(delta).min(len - 1)),
             None => 0,
         };
-        state.selected_pid = Some(state.rows[next].pid);
-        state
+        let next_pid = self.visible_rows().nth(next).map(|r| r.pid);
+        self.processes.selected_pid = next_pid;
+        self.processes
             .scroll_handle
             .scroll_to_item(next, ScrollStrategy::Nearest);
         cx.notify();
     }
 
-    fn selected_row(&self) -> Option<&ProcessRow> {
-        let pid = self.processes.selected_pid?;
-        self.processes.rows.iter().find(|r| r.pid == pid)
-    }
-
-    /// Sends SIGTERM (or SIGKILL when `force`) to the selected process.
-    pub fn signal_selected(&mut self, force: bool, cx: &mut Context<Self>) {
+    /// Ends the selected process (SIGTERM), or kills it (SIGKILL) when `force`.
+    pub fn signal_selected(&mut self, kind: SignalKind, cx: &mut Context<Self>) {
         let Some(row) = self.selected_row() else {
             return;
         };
-        let (pid, name) = (row.pid, row.name.clone());
-        self.signal_process(pid, name, force, cx);
+        let (pid, start_time, name) = (row.pid, row.start_time, row.name.clone());
+        self.send_signal(pid, start_time, &name, kind, cx);
     }
 
-    fn signal_process(
+    fn send_signal(
         &mut self,
         pid: u32,
-        name: SharedString,
-        force: bool,
+        start_time: u64,
+        name: &str,
+        kind: SignalKind,
         cx: &mut Context<Self>,
     ) {
-        let signal = if force { Signal::KILL } else { Signal::TERM };
-        let result = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .ok_or(Errno::INVAL)
-            .and_then(|pid| rustix::process::kill_process(pid, signal));
-        let (message, kind) = match result {
-            Ok(()) if force => (format!("Force-killed {name} ({pid})"), ToastKind::Success),
-            Ok(()) => (format!("Asked {name} ({pid}) to close"), ToastKind::Success),
-            Err(Errno::PERM) => (
+        let (message, toast) = match (signal_process(pid, start_time, kind), kind) {
+            (Ok(()), SignalKind::Kill) => {
+                (format!("Force-killed {name} ({pid})"), ToastKind::Success)
+            }
+            (Ok(()), SignalKind::Terminate) => {
+                (format!("Asked {name} ({pid}) to close"), ToastKind::Success)
+            }
+            (Err(SignalError::PermissionDenied), _) => (
                 format!("Permission denied: {name} ({pid}) belongs to another user"),
                 ToastKind::Error,
             ),
-            Err(Errno::SRCH) => (
+            (Err(SignalError::Exited), _) => (
                 format!("{name} ({pid}) has already exited"),
                 ToastKind::Info,
             ),
-            Err(err) => (
+            (Err(SignalError::Other(err)), _) => (
                 format!("Could not end {name} ({pid}): {err}"),
                 ToastKind::Error,
             ),
         };
-        self.show_toast(message, kind, cx);
+        self.show_toast(message, toast, cx);
     }
 
     fn copy_to_clipboard(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
@@ -271,7 +303,28 @@ impl TaskManager {
         self.show_toast(format!("Copied {what}"), ToastKind::Info, cx);
     }
 
-    pub fn render_processes(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.processes.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Benchmark helper: scrolls the table continuously, bouncing between the ends.
+    pub fn bench_scroll(&self, elapsed: f32) {
+        let handle = self.processes.scroll_handle.0.borrow();
+        let max = (self.processes.rows.len() as f32 * f32::from(ROW_HEIGHT)
+            - f32::from(handle.base_handle.bounds().size.height))
+        .max(1.0);
+        let travel = (elapsed * 2400.0) % (2.0 * max);
+        let y = if travel > max {
+            2.0 * max - travel
+        } else {
+            travel
+        };
+        handle.base_handle.set_offset(point(px(0.), px(-y)));
+    }
+
+    pub fn render_processes(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = theme();
         let body = if self.snapshot.is_none() {
             empty_state("Loading processes…").into_any_element()
@@ -287,13 +340,16 @@ impl TaskManager {
                         "processes",
                         self.processes.rows.len(),
                         cx.processor(|this, range: Range<usize>, _window, cx| {
-                            let mut items = Vec::with_capacity(range.len());
-                            for i in range {
-                                if let Some(row) = this.processes.rows.get(i).cloned() {
-                                    items.push(this.render_row(i, &row, cx));
-                                }
-                            }
-                            items
+                            let this = &*this;
+                            let Some(snapshot) = &this.snapshot else {
+                                return Vec::new();
+                            };
+                            let order = this.processes.rows.get(range.clone()).unwrap_or(&[]);
+                            order
+                                .iter()
+                                .zip(range)
+                                .map(|(&ix, i)| this.render_row(i, &snapshot.processes[ix], cx))
+                                .collect()
                         }),
                     )
                     .size_full()
@@ -342,64 +398,50 @@ impl TaskManager {
                     (true, SortDirection::Ascending) => " ▲",
                     (true, SortDirection::Descending) => " ▼",
                 };
-                let cell = div()
-                    .id(SharedString::from(format!("col-{}", column.label())))
-                    .flex()
-                    .h_full()
-                    .items_center()
-                    .px_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(t.row_hover).text_color(t.text))
-                    .when(active, |s| s.text_color(t.accent))
-                    .when(column.is_numeric(), |s| s.justify_end())
-                    .child(format!("{}{arrow}", column.label()))
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.sort_by(column, cx)),
-                    );
-                size_column(cell, column)
+                column.size(
+                    div()
+                        .id(("column", column as usize))
+                        .flex()
+                        .h_full()
+                        .items_center()
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.row_hover).text_color(t.text))
+                        .when(active, |s| s.text_color(t.accent))
+                        .when(column.is_numeric(), |s| s.justify_end())
+                        .child(column.label())
+                        .child(arrow)
+                        .on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.sort_by(column, cx)
+                            }),
+                        ),
+                )
             }))
     }
 
     fn render_row(&self, index: usize, row: &ProcessRow, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = theme();
-        let selected = self.processes.selected_pid == Some(row.pid);
-        let menu_open = self
-            .processes
-            .context_menu
-            .as_ref()
-            .is_some_and(|m| m.pid == row.pid);
-        let mem_total = self.snapshot.as_ref().map_or(0, |s| s.memory_total).max(1);
-        let pid = row.pid;
-        let name = row.name.clone();
-
-        let numeric = |column: Column, text: String, tint: Hsla| {
-            size_column(
-                div()
-                    .flex()
-                    .h_full()
-                    .items_center()
-                    .justify_end()
-                    .px_2()
-                    .bg(tint)
-                    .child(text),
-                column,
-            )
-        };
+        let highlighted = self.processes.selected_pid == Some(row.pid)
+            || self
+                .processes
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| m.pid == row.pid);
+        let memory_total = self.snapshot.as_ref().map_or(0, |s| s.memory_total);
+        let (pid, start_time) = (row.pid, row.start_time);
+        let (name, user) = (row.name.clone(), row.user.clone());
 
         div()
             .id(("process", pid as usize))
-            .flex()
             .w_full()
-            .flex_row()
-            .items_center()
             .h(ROW_HEIGHT)
             .px_2()
             .text_sm()
-            .text_color(t.text)
             .when(index % 2 == 1, |s| s.bg(t.surface_raised.opacity(0.35)))
             .hover(|s| s.bg(t.row_hover))
-            .when(selected || menu_open, |s| s.bg(t.row_selected))
+            .when(highlighted, |s| s.bg(t.row_selected))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.processes.selected_pid = Some(pid);
                 window.focus(&this.focus_handle, cx);
@@ -411,72 +453,47 @@ impl TaskManager {
                     this.processes.selected_pid = Some(pid);
                     this.processes.context_menu = Some(ContextMenu {
                         pid,
+                        start_time,
                         name: name.clone(),
+                        user: user.clone(),
                         position: ev.position,
                     });
                     window.focus(&this.focus_handle, cx);
                     cx.notify();
                 }),
             )
-            .child(size_column(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .overflow_hidden()
-                    .child(process_badge(&row.name))
-                    .child(div().truncate().child(row.name.clone())),
-                Column::Name,
-            ))
-            .child(size_column(
-                div()
-                    .flex()
-                    .justify_end()
-                    .px_2()
-                    .text_color(t.text_faint)
-                    .child(row.pid.to_string()),
-                Column::Pid,
-            ))
-            .child(size_column(
-                div()
-                    .px_2()
-                    .truncate()
-                    .text_color(t.text_muted)
-                    .child(row.user.clone()),
-                Column::User,
-            ))
-            .child(numeric(
-                Column::Cpu,
-                format::percent(row.cpu),
-                heat(t.cpu, row.cpu / 25.0),
-            ))
-            .child(numeric(
-                Column::Memory,
-                format::bytes(row.memory),
-                heat(t.memory, row.memory as f32 / mem_total as f32 * 4.0),
-            ))
-            .child(numeric(
-                Column::Disk,
-                format::rate(row.disk),
-                heat(t.disk, row.disk as f32 / (50.0 * 1024.0 * 1024.0)),
-            ))
+            .child(RowCells::new(row, memory_total))
     }
 
     pub fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let t = theme();
         let menu = self.processes.context_menu.as_ref()?;
-        let (pid, name) = (menu.pid, menu.name.clone());
-        let user = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.processes.iter().find(|p| p.pid == pid))
-            .map(|p| p.user.clone())
-            .unwrap_or_default();
+        let (pid, start_time, name) = (menu.pid, menu.start_time, menu.name.clone());
 
-        let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.processes.context_menu = None;
-            cx.notify();
+        let signal_item = |id, label, shortcut, color, kind, cx: &mut Context<Self>| {
+            let name = name.clone();
+            menu_item(
+                id,
+                label,
+                shortcut,
+                color,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.send_signal(pid, start_time, &name, kind, cx);
+                }),
+            )
+        };
+        let copy_item = |id, label, text: String, what: &'static str, cx: &mut Context<Self>| {
+            menu_item(
+                id,
+                label,
+                "",
+                t.text,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.copy_to_clipboard(text.clone(), what, cx);
+                }),
+            )
         };
 
         let menu_el = div()
@@ -492,7 +509,9 @@ impl TaskManager {
             .bg(t.surface_raised)
             .shadow_lg()
             .text_sm()
-            .on_mouse_down_out(cx.listener(move |this, _: &MouseDownEvent, _, cx| close(this, cx)))
+            .on_mouse_down_out(
+                cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_context_menu(cx)),
+            )
             .child(
                 div()
                     .flex()
@@ -507,67 +526,45 @@ impl TaskManager {
                             .text_color(t.text)
                             .child(name.clone()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(t.text_faint)
-                            .child(if user.is_empty() {
-                                format!("PID {pid}")
-                            } else {
-                                format!("PID {pid} · {user}")
-                            }),
-                    ),
+                    .child(div().text_xs().text_color(t.text_faint).child(
+                        if menu.user.is_empty() {
+                            format!("PID {pid}")
+                        } else {
+                            format!("PID {pid} · {}", menu.user)
+                        },
+                    )),
             )
             .child(menu_divider())
-            .child(menu_item(
+            .child(signal_item(
                 "end",
                 "End process",
                 "Del",
                 t.text,
-                cx.listener({
-                    let name = name.clone();
-                    move |this, _: &ClickEvent, _, cx| {
-                        close(this, cx);
-                        this.signal_process(pid, name.clone(), false, cx);
-                    }
-                }),
+                SignalKind::Terminate,
+                cx,
             ))
-            .child(menu_item(
+            .child(signal_item(
                 "kill",
                 "Force kill",
                 "Shift+Del",
                 t.danger,
-                cx.listener({
-                    let name = name.clone();
-                    move |this, _: &ClickEvent, _, cx| {
-                        close(this, cx);
-                        this.signal_process(pid, name.clone(), true, cx);
-                    }
-                }),
+                SignalKind::Kill,
+                cx,
             ))
             .child(menu_divider())
-            .child(menu_item(
+            .child(copy_item(
                 "copy-name",
                 "Copy name",
-                "",
-                t.text,
-                cx.listener({
-                    let name = name.clone();
-                    move |this, _: &ClickEvent, _, cx| {
-                        close(this, cx);
-                        this.copy_to_clipboard(name.to_string(), "process name", cx);
-                    }
-                }),
+                name.to_string(),
+                "process name",
+                cx,
             ))
-            .child(menu_item(
+            .child(copy_item(
                 "copy-pid",
                 "Copy PID",
-                "",
-                t.text,
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    close(this, cx);
-                    this.copy_to_clipboard(pid.to_string(), "PID", cx);
-                }),
+                pid.to_string(),
+                "PID",
+                cx,
             ));
 
         Some(
@@ -665,33 +662,13 @@ impl TaskManager {
     }
 }
 
-/// Applies a column's width so header cells and row cells line up.
-fn size_column<E: Styled>(el: E, column: Column) -> E {
-    match column.width() {
-        Some(w) => el.w(w).flex_shrink_0(),
-        None => el.flex_1().min_w(px(120.)),
-    }
-}
-
-fn empty_state(message: impl Into<SharedString>) -> Div {
-    let t = theme();
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_sm()
-        .text_color(t.text_faint)
-        .child(message.into())
-}
-
 fn menu_item(
     id: &'static str,
     label: &'static str,
     shortcut: &'static str,
-    color: gpui::Rgba,
+    color: Rgba,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let t = theme();
     div()
         .id(id)
@@ -713,71 +690,52 @@ fn menu_divider() -> impl IntoElement {
     div().h(px(1.)).mx_1().my_1().bg(theme().border)
 }
 
-/// A small colored initial so processes are easy to tell apart while scanning.
-fn process_badge(name: &str) -> impl IntoElement {
-    let initial = name
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "•".into());
-    let hue = (name
-        .bytes()
-        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))
-        % 360) as f32
-        / 360.0;
-    div()
-        .flex()
-        .flex_shrink_0()
-        .size(px(18.))
-        .items_center()
-        .justify_center()
-        .rounded(px(5.))
-        .bg(gpui::hsla(hue, 0.45, 0.35, 1.0))
-        .text_color(gpui::hsla(hue, 0.6, 0.88, 1.0))
-        .text_xs()
-        .font_weight(gpui::FontWeight::BOLD)
-        .child(initial)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn row(pid: u32, name: &str, user: &str, cpu: f32) -> ProcessRow {
-        ProcessRow {
+        ProcessRow::new(
             pid,
-            name: name.to_owned().into(),
-            user: user.to_owned().into(),
+            0,
+            name.to_owned().into(),
+            user.to_owned().into(),
             cpu,
-            memory: 0,
-            disk: 0,
-        }
+            0,
+            0,
+        )
     }
 
-    fn pids(rows: &[ProcessRow]) -> Vec<u32> {
-        rows.iter().map(|r| r.pid).collect()
+    fn sorted_pids(rows: &[ProcessRow], column: Column, dir: SortDirection) -> Vec<u32> {
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        sort_rows(rows, &mut order, column, dir);
+        order.into_iter().map(|ix| rows[ix].pid).collect()
     }
 
     #[test]
     fn sorts_numeric_descending_with_pid_tiebreak() {
-        let mut rows = vec![
+        let rows = [
             row(3, "a", "", 1.0),
             row(1, "b", "", 5.0),
             row(2, "c", "", 1.0),
         ];
-        sort_rows(&mut rows, Column::Cpu, SortDirection::Descending);
-        assert_eq!(pids(&rows), [1, 2, 3]);
+        assert_eq!(
+            sorted_pids(&rows, Column::Cpu, SortDirection::Descending),
+            [1, 2, 3]
+        );
     }
 
     #[test]
     fn sorts_names_case_insensitively() {
-        let mut rows = vec![
+        let rows = [
             row(1, "zsh", "", 0.0),
             row(2, "Firefox", "", 0.0),
             row(3, "bash", "", 0.0),
         ];
-        sort_rows(&mut rows, Column::Name, SortDirection::Ascending);
-        assert_eq!(pids(&rows), [3, 2, 1]);
+        assert_eq!(
+            sorted_pids(&rows, Column::Name, SortDirection::Ascending),
+            [3, 2, 1]
+        );
     }
 
     #[test]
@@ -796,11 +754,12 @@ mod tests {
     #[test]
     fn search_matches_name_user_and_pid_prefix() {
         let firefox = row(4242, "Firefox", "trevor", 0.0);
-        assert!(matches_query(&firefox, ""));
-        assert!(matches_query(&firefox, "  fire "));
-        assert!(matches_query(&firefox, "TREV"));
-        assert!(matches_query(&firefox, "42"));
-        assert!(!matches_query(&firefox, "24"));
-        assert!(!matches_query(&firefox, "chrome"));
+        let matches = |q: &str| Query::new(q).matches(&firefox);
+        assert!(matches(""));
+        assert!(matches("  fire "));
+        assert!(matches("TREV"));
+        assert!(matches("42"));
+        assert!(!matches("24"));
+        assert!(!matches("chrome"));
     }
 }

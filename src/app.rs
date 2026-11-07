@@ -4,18 +4,21 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, FocusHandle, Focusable, KeyBinding, Rgba, SharedString,
-    Subscription, Task, Window, actions, canvas, div, point, prelude::*, px, relative,
+    AnyElement, App, ClickEvent, Context, FocusHandle, Focusable, KeyBinding, SharedString,
+    Subscription, Task, Window, actions, canvas, div, prelude::*, px,
 };
 
 use crate::{
+    bench::{Bench, PaintMarker, Phase},
     format,
-    graph::{Line, graph},
+    graph::graph,
     performance::{History, Resource},
+    process_control::SignalKind,
     processes::ProcessesState,
     sampler::{Sampler, Snapshot},
     text_input::TextInputEvent,
     theme::theme,
+    ui::{color_dot, progress_bar, search_icon},
 };
 
 const CONTEXT: &str = "TaskManager";
@@ -82,6 +85,7 @@ pub struct TaskManager {
     pub processes: ProcessesState,
     pub resource: Resource,
     toast: Option<Toast>,
+    bench: Option<Bench>,
     _subscriptions: Vec<Subscription>,
     _refresh_task: Task<()>,
 }
@@ -96,7 +100,11 @@ impl TaskManager {
             });
 
         let refresh_task = cx.spawn(async move |this, cx| {
-            let mut sampler = Sampler::new();
+            // Creating the sampler takes a full priming sample; keep that off the UI thread too.
+            let mut sampler = cx
+                .background_executor()
+                .spawn(async { Sampler::new() })
+                .await;
             let mut delay = FIRST_SAMPLE_DELAY;
             loop {
                 cx.background_executor().timer(delay).await;
@@ -130,12 +138,16 @@ impl TaskManager {
             processes,
             resource: Resource::Cpu,
             toast: None,
+            bench: Bench::from_env(),
             _subscriptions: vec![search_subscription],
             _refresh_task: refresh_task,
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        if let Some(bench) = &mut self.bench {
+            bench.note_sample();
+        }
         self.history.record(&snapshot);
         self.snapshot = Some(snapshot);
         self.rebuild_rows(cx);
@@ -190,7 +202,7 @@ impl TaskManager {
 
     fn end_process(&mut self, _: &EndProcess, _: &mut Window, cx: &mut Context<Self>) {
         if self.tab == Tab::Processes {
-            self.signal_selected(false, cx);
+            self.signal_selected(SignalKind::Terminate, cx);
         }
     }
 
@@ -202,7 +214,7 @@ impl TaskManager {
     ) {
         // Shift+Delete is a text-editing chord too; never kill from inside the search box.
         if self.tab == Tab::Processes && !self.search_focused(window, cx) {
-            self.signal_selected(true, cx);
+            self.signal_selected(SignalKind::Kill, cx);
         }
     }
 
@@ -241,24 +253,31 @@ impl TaskManager {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
-        let h = &self.history;
-        let subtitle: SharedString = match &self.snapshot {
-            Some(s) => format!(
+        let fallback;
+        let s = match &self.snapshot {
+            Some(s) => s,
+            None => {
+                fallback = Snapshot::default();
+                &fallback
+            }
+        };
+        let subtitle: SharedString = if self.snapshot.is_some() {
+            format!(
                 "{} processes · {} logical cores · up {}",
                 s.processes.len(),
                 s.cpu_cores.len(),
                 format::duration(s.uptime_secs)
             )
-            .into(),
-            None => "Gathering system information…".into(),
-        };
-        let s = self.snapshot.clone().unwrap_or_default();
-        let mem_fraction = if s.memory_total == 0 {
-            0.0
+            .into()
         } else {
-            s.memory_used as f32 / s.memory_total as f32
+            "Gathering system information…".into()
         };
-        let net_ceiling = format::nice_ceiling(h.net_rx.max().max(h.net_tx.max()));
+        let sparkline = |resource: Resource| {
+            let (lines, max) = resource.graph_lines(&self.history);
+            graph(("header", resource as usize), lines, max, 0)
+                .size_full()
+                .into_any_element()
+        };
 
         div()
             .flex()
@@ -285,44 +304,27 @@ impl TaskManager {
                     )
                     .child(div().text_sm().text_color(t.text_faint).child(subtitle)),
             )
-            .child(
-                self.stat_card(
-                    Resource::Cpu,
-                    format::percent(s.cpu),
-                    None,
-                    graph(vec![Line::new(&h.cpu, t.cpu)], 100.0, 0)
-                        .h(px(22.))
-                        .w_full()
-                        .into_any_element(),
-                    cx,
-                ),
-            )
+            .child(self.stat_card(
+                Resource::Cpu,
+                format::percent(s.cpu),
+                None,
+                sparkline(Resource::Cpu),
+                cx,
+            ))
             .child(self.stat_card(
                 Resource::Memory,
                 format::bytes(s.memory_used),
                 Some(format!("of {}", format::bytes(s.memory_total))),
-                progress_bar(mem_fraction, t.memory).into_any_element(),
+                progress_bar(s.memory_fraction(), t.memory).into_any_element(),
                 cx,
             ))
-            .child(
-                self.stat_card(
-                    Resource::Network,
-                    format!("↓ {}", format::speed(s.net_rx)),
-                    Some(format!("↑ {}", format::speed(s.net_tx))),
-                    graph(
-                        vec![
-                            Line::new(&h.net_rx, t.net_rx),
-                            Line::new(&h.net_tx, t.net_tx).without_area(),
-                        ],
-                        net_ceiling,
-                        0,
-                    )
-                    .h(px(22.))
-                    .w_full()
-                    .into_any_element(),
-                    cx,
-                ),
-            )
+            .child(self.stat_card(
+                Resource::Network,
+                format!("↓ {}", format::speed(s.net_rx)),
+                Some(format!("↑ {}", format::speed(s.net_tx))),
+                sparkline(Resource::Network),
+                cx,
+            ))
     }
 
     /// A summary card; clicking it opens that resource on the Performance tab.
@@ -335,26 +337,12 @@ impl TaskManager {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme();
-        let label = match resource {
-            Resource::Cpu => "CPU",
-            Resource::Memory => "Memory",
-            Resource::Network => "Network",
-            Resource::Disk => "Disk",
-        };
-        let color = match resource {
-            Resource::Cpu => t.cpu,
-            Resource::Memory => t.memory,
-            Resource::Network => t.net_rx,
-            Resource::Disk => t.disk,
-        };
         div()
-            .id(SharedString::from(format!("stat-{label}")))
+            .id(("stat", resource as usize))
             .flex()
             .flex_col()
-            .justify_between()
             .gap_1p5()
             .w(px(190.))
-            .h(px(86.))
             .px_3()
             .py_2p5()
             .rounded_lg()
@@ -374,15 +362,15 @@ impl TaskManager {
                     .gap_1p5()
                     .text_xs()
                     .text_color(t.text_muted)
-                    .child(div().size_2().rounded_full().bg(color))
-                    .child(label),
+                    .child(color_dot(resource.color()))
+                    .child(resource.label()),
             )
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .gap_1p5()
-                    .overflow_hidden()
+                    .min_w_0()
                     .child(
                         div()
                             .flex_shrink_0()
@@ -391,12 +379,17 @@ impl TaskManager {
                             .text_color(t.text)
                             .child(value),
                     )
-                    .children(
-                        detail
-                            .map(|d| div().truncate().text_xs().text_color(t.text_faint).child(d)),
-                    ),
+                    .children(detail.map(|d| {
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(t.text_faint)
+                            .child(d)
+                    })),
             )
-            .child(visual)
+            // Same height for every card's visual keeps the cards aligned.
+            .child(div().h(px(22.)).flex().items_end().child(visual))
     }
 
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -567,6 +560,7 @@ impl Focusable for TaskManager {
 impl Render for TaskManager {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
+        let bench_painted = self.drive_bench(window, cx);
         let body = match self.tab {
             Tab::Processes => self.render_processes(cx),
             Tab::Performance => self.render_performance(cx),
@@ -593,43 +587,37 @@ impl Render for TaskManager {
             .child(body)
             .child(self.render_footer(cx))
             .children(self.render_context_menu(cx))
+            .children(bench_painted.map(|painted_at| {
+                // Painted last, so it marks when this frame's CPU work finished.
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, _, _| painted_at.set(Some(Instant::now())),
+                )
+                .absolute()
+                .size_0()
+            }))
     }
 }
 
-fn progress_bar(fraction: f32, color: Rgba) -> impl IntoElement {
-    div()
-        .h(px(4.))
-        .w_full()
-        .rounded_full()
-        .bg(theme().border)
-        .child(
-            div()
-                .h_full()
-                .rounded_full()
-                .bg(color)
-                .w(relative(fraction.clamp(0.0, 1.0))),
-        )
-}
-
-/// A magnifying glass drawn with paths, so no icon font or asset is needed.
-fn search_icon(color: Rgba) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let r = px(4.5);
-            let c = point(bounds.left() + px(6.), bounds.top() + px(6.));
-            let mut ring = gpui::PathBuilder::stroke(px(1.5));
-            ring.move_to(point(c.x + r, c.y));
-            ring.arc_to(point(r, r), px(0.), false, true, point(c.x - r, c.y));
-            ring.arc_to(point(r, r), px(0.), false, true, point(c.x + r, c.y));
-            let handle_start = point(c.x + r * 0.72, c.y + r * 0.72);
-            ring.move_to(handle_start);
-            ring.line_to(point(handle_start.x + px(3.5), handle_start.y + px(3.5)));
-            if let Ok(path) = ring.build() {
-                window.paint_path(path, color);
+impl TaskManager {
+    /// In benchmark mode, steers the UI through each phase and keeps frames coming.
+    fn drive_bench(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<PaintMarker> {
+        let Some(frame) = self.bench.as_mut()?.begin_frame() else {
+            cx.quit();
+            return None;
+        };
+        match frame.phase {
+            Phase::ProcessesIdle => self.tab = Tab::Processes,
+            Phase::ProcessesScrolling => {
+                self.tab = Tab::Processes;
+                self.bench_scroll(frame.elapsed);
             }
-        },
-    )
-    .size(px(15.))
-    .flex_shrink_0()
+            Phase::Performance(resource) => {
+                self.tab = Tab::Performance;
+                self.resource = resource;
+            }
+        }
+        window.request_animation_frame();
+        Some(frame.painted_at)
+    }
 }

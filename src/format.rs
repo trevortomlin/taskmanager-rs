@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(rate(0), "—");
         assert_eq!(rate(2048), "2.0 KB/s");
         assert_eq!(percent(0.01), "0%");
-        assert_eq!(percent(3.14), "3.1%");
+        assert_eq!(percent(2.54), "2.5%");
         assert_eq!(percent(42.6), "43%");
     }
 }

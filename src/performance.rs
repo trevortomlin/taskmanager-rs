@@ -8,9 +8,10 @@ use gpui::{
 use crate::{
     app::TaskManager,
     format,
-    graph::{HISTORY_LEN, Line, Series, graph},
+    graph::{HISTORY_LABEL, Line, Series, graph},
     sampler::Snapshot,
     theme::theme,
+    ui::{color_dot, empty_state, section_heading, stat_tile},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,7 +30,7 @@ impl Resource {
         Resource::Disk,
     ];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Resource::Cpu => "CPU",
             Resource::Memory => "Memory",
@@ -38,13 +39,42 @@ impl Resource {
         }
     }
 
-    fn color(self) -> Rgba {
+    pub fn color(self) -> Rgba {
         let t = theme();
         match self {
             Resource::Cpu => t.cpu,
             Resource::Memory => t.memory,
             Resource::Network => t.net_rx,
             Resource::Disk => t.disk,
+        }
+    }
+
+    /// The lines graphed for this resource, plus the value they're scaled to.
+    pub fn graph_lines(self, h: &History) -> (Vec<Line>, f32) {
+        let t = theme();
+        match self {
+            Resource::Cpu => (vec![Line::new(&h.cpu, t.cpu)], 100.0),
+            Resource::Memory => (
+                vec![
+                    Line::new(&h.memory, t.memory),
+                    Line::new(&h.swap, t.swap).without_area(),
+                ],
+                100.0,
+            ),
+            Resource::Network => (
+                vec![
+                    Line::new(&h.net_rx, t.net_rx),
+                    Line::new(&h.net_tx, t.net_tx).without_area(),
+                ],
+                h.network_ceiling(),
+            ),
+            Resource::Disk => (
+                vec![
+                    Line::new(&h.disk_read, t.disk),
+                    Line::new(&h.disk_write, t.disk_write).without_area(),
+                ],
+                h.disk_ceiling(),
+            ),
         }
     }
 }
@@ -70,15 +100,15 @@ impl History {
         for (series, usage) in self.cores.iter_mut().zip(&s.cpu_cores) {
             series.push(*usage);
         }
-        self.memory.push(percent_of(s.memory_used, s.memory_total));
-        self.swap.push(percent_of(s.swap_used, s.swap_total));
+        self.memory.push(s.memory_fraction() * 100.0);
+        self.swap.push(s.swap_fraction() * 100.0);
         self.net_rx.push(s.net_rx as f32);
         self.net_tx.push(s.net_tx as f32);
         self.disk_read.push(s.disk_read as f32);
         self.disk_write.push(s.disk_write as f32);
     }
 
-    fn network_ceiling(&self) -> f32 {
+    pub fn network_ceiling(&self) -> f32 {
         format::nice_ceiling(self.net_rx.max().max(self.net_tx.max()))
     }
 
@@ -87,26 +117,19 @@ impl History {
     }
 }
 
-fn percent_of(used: u64, total: u64) -> f32 {
-    if total == 0 {
-        0.0
-    } else {
-        used as f32 / total as f32 * 100.0
-    }
+/// Everything that differs between the resource detail views.
+struct Detail {
+    subtitle: SharedString,
+    scale_label: String,
+    legend: Vec<(&'static str, Rgba)>,
+    stats: Vec<(&'static str, String)>,
+    extra: Option<AnyElement>,
 }
 
 impl TaskManager {
-    pub fn render_performance(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(snapshot) = self.snapshot.clone() else {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(theme().text_faint)
-                .child("Gathering system information…")
-                .into_any_element();
+    pub fn render_performance(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(snapshot) = &self.snapshot else {
+            return empty_state("Gathering system information…").into_any_element();
         };
 
         div()
@@ -125,10 +148,10 @@ impl TaskManager {
                     .flex_shrink_0()
                     .children(
                         Resource::ALL
-                            .map(|resource| self.render_resource_card(resource, &snapshot, cx)),
+                            .map(|resource| self.render_resource_card(resource, snapshot, cx)),
                     ),
             )
-            .child(self.render_detail(&snapshot))
+            .child(self.render_detail(snapshot))
             .into_any_element()
     }
 
@@ -139,47 +162,30 @@ impl TaskManager {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let t = theme();
-        let h = &self.history;
         let selected = self.resource == resource;
-        let (value, detail, lines, max) = match resource {
-            Resource::Cpu => (
-                format::percent(s.cpu),
-                format::frequency(s.cpu_frequency),
-                vec![Line::new(&h.cpu, t.cpu)],
-                100.0,
-            ),
+        let (value, detail) = match resource {
+            Resource::Cpu => (format::percent(s.cpu), format::frequency(s.cpu_frequency)),
             Resource::Memory => (
                 format::bytes(s.memory_used),
                 format!(
                     "{:.0}% of {}",
-                    percent_of(s.memory_used, s.memory_total),
+                    s.memory_fraction() * 100.0,
                     format::bytes(s.memory_total)
                 ),
-                vec![Line::new(&h.memory, t.memory)],
-                100.0,
             ),
             Resource::Network => (
                 format!("↓ {}", format::speed(s.net_rx)),
                 format!("↑ {}", format::speed(s.net_tx)),
-                vec![
-                    Line::new(&h.net_rx, t.net_rx),
-                    Line::new(&h.net_tx, t.net_tx).without_area(),
-                ],
-                h.network_ceiling(),
             ),
             Resource::Disk => (
-                format!("R {}", format::rate(s.disk_read)),
-                format!("W {}", format::rate(s.disk_write)),
-                vec![
-                    Line::new(&h.disk_read, t.disk),
-                    Line::new(&h.disk_write, t.disk_write).without_area(),
-                ],
-                h.disk_ceiling(),
+                format!("R {}", format::speed(s.disk_read)),
+                format!("W {}", format::speed(s.disk_write)),
             ),
         };
+        let (lines, max) = resource.graph_lines(&self.history);
 
         div()
-            .id(SharedString::from(format!("resource-{}", resource.label())))
+            .id(("resource", resource as usize))
             .flex()
             .flex_col()
             .gap_1()
@@ -215,7 +221,7 @@ impl TaskManager {
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(t.text)
-                            .child(div().size_2().rounded_full().bg(resource.color()))
+                            .child(color_dot(resource.color()))
                             .child(resource.label()),
                     )
                     .child(div().text_sm().text_color(t.text).child(value)),
@@ -227,26 +233,20 @@ impl TaskManager {
                     .truncate()
                     .child(detail),
             )
-            .child(graph(lines, max, 0).h(px(34.)).w_full().mt_1())
+            .child(
+                graph(("sidebar", resource as usize), lines, max, 0)
+                    .h(px(34.))
+                    .w_full()
+                    .mt_1(),
+            )
     }
 
-    fn render_detail(&self, s: &Snapshot) -> impl IntoElement {
+    fn detail(&self, s: &Snapshot) -> Detail {
         let t = theme();
         let h = &self.history;
-
-        let Detail {
-            subtitle,
-            lines,
-            max,
-            scale_label,
-            legend,
-            stats,
-            extra,
-        } = match self.resource {
+        match self.resource {
             Resource::Cpu => Detail {
                 subtitle: s.cpu_brand.clone(),
-                lines: vec![Line::new(&h.cpu, t.cpu)],
-                max: 100.0,
                 scale_label: "100%".into(),
                 legend: vec![],
                 stats: vec![
@@ -260,11 +260,6 @@ impl TaskManager {
             },
             Resource::Memory => Detail {
                 subtitle: format!("{} total", format::bytes(s.memory_total)).into(),
-                lines: vec![
-                    Line::new(&h.memory, t.memory),
-                    Line::new(&h.swap, t.swap).without_area(),
-                ],
-                max: 100.0,
                 scale_label: "100%".into(),
                 legend: vec![("Memory", t.memory), ("Swap", t.swap)],
                 stats: vec![
@@ -273,10 +268,7 @@ impl TaskManager {
                         "Available",
                         format::bytes(s.memory_total.saturating_sub(s.memory_used)),
                     ),
-                    (
-                        "Usage",
-                        format!("{:.0}%", percent_of(s.memory_used, s.memory_total)),
-                    ),
+                    ("Usage", format!("{:.0}%", s.memory_fraction() * 100.0)),
                     (
                         "Swap",
                         format!(
@@ -288,55 +280,51 @@ impl TaskManager {
                 ],
                 extra: None,
             },
-            Resource::Network => {
-                let ceiling = h.network_ceiling();
-                Detail {
-                    subtitle: match s.interfaces.len() {
-                        0 => "No active interfaces".into(),
-                        1 => s.interfaces[0].name.clone(),
-                        n => format!("{n} interfaces").into(),
-                    },
-                    lines: vec![
-                        Line::new(&h.net_rx, t.net_rx),
-                        Line::new(&h.net_tx, t.net_tx).without_area(),
-                    ],
-                    max: ceiling,
-                    scale_label: format::speed(ceiling as u64),
-                    legend: vec![("Receive", t.net_rx), ("Send", t.net_tx)],
-                    stats: vec![
-                        ("Receiving", format::speed(s.net_rx)),
-                        ("Sending", format::speed(s.net_tx)),
-                        (
-                            "Received since boot",
-                            format::bytes(s.interfaces.iter().map(|i| i.total_rx).sum()),
-                        ),
-                        (
-                            "Sent since boot",
-                            format::bytes(s.interfaces.iter().map(|i| i.total_tx).sum()),
-                        ),
-                    ],
-                    extra: Some(self.render_interfaces(s).into_any_element()),
-                }
-            }
-            Resource::Disk => {
-                let ceiling = h.disk_ceiling();
-                Detail {
-                    subtitle: "All processes".into(),
-                    lines: vec![
-                        Line::new(&h.disk_read, t.disk),
-                        Line::new(&h.disk_write, t.disk_write).without_area(),
-                    ],
-                    max: ceiling,
-                    scale_label: format::speed(ceiling as u64),
-                    legend: vec![("Read", t.disk), ("Write", t.disk_write)],
-                    stats: vec![
-                        ("Reading", format::speed(s.disk_read)),
-                        ("Writing", format::speed(s.disk_write)),
-                    ],
-                    extra: None,
-                }
-            }
-        };
+            Resource::Network => Detail {
+                subtitle: match s.interfaces.len() {
+                    0 => "No active interfaces".into(),
+                    1 => s.interfaces[0].name.clone(),
+                    n => format!("{n} interfaces").into(),
+                },
+                scale_label: format::speed(h.network_ceiling() as u64),
+                legend: vec![("Receive", t.net_rx), ("Send", t.net_tx)],
+                stats: vec![
+                    ("Receiving", format::speed(s.net_rx)),
+                    ("Sending", format::speed(s.net_tx)),
+                    (
+                        "Received since boot",
+                        format::bytes(s.interfaces.iter().map(|i| i.total_rx).sum()),
+                    ),
+                    (
+                        "Sent since boot",
+                        format::bytes(s.interfaces.iter().map(|i| i.total_tx).sum()),
+                    ),
+                ],
+                extra: Some(render_interfaces(s).into_any_element()),
+            },
+            Resource::Disk => Detail {
+                subtitle: "All processes".into(),
+                scale_label: format::speed(h.disk_ceiling() as u64),
+                legend: vec![("Read", t.disk), ("Write", t.disk_write)],
+                stats: vec![
+                    ("Reading", format::speed(s.disk_read)),
+                    ("Writing", format::speed(s.disk_write)),
+                ],
+                extra: None,
+            },
+        }
+    }
+
+    fn render_detail(&self, s: &Snapshot) -> impl IntoElement {
+        let t = theme();
+        let Detail {
+            subtitle,
+            scale_label,
+            legend,
+            stats,
+            extra,
+        } = self.detail(s);
+        let (lines, max) = self.resource.graph_lines(&self.history);
 
         div()
             .id("performance-detail")
@@ -399,7 +387,10 @@ impl TaskManager {
                             .border_color(t.border)
                             .bg(t.background)
                             .overflow_hidden()
-                            .child(graph(lines, max, 4).size_full()),
+                            .child(
+                                graph(("detail", self.resource as usize), lines, max, 4)
+                                    .size_full(),
+                            ),
                     )
                     .child(
                         div()
@@ -407,7 +398,7 @@ impl TaskManager {
                             .justify_between()
                             .text_xs()
                             .text_color(t.text_faint)
-                            .child(format!("{HISTORY_LEN} seconds"))
+                            .child(HISTORY_LABEL)
                             .child("now"),
                     ),
             )
@@ -452,107 +443,66 @@ impl TaskManager {
                                 ),
                         )
                         .child(
-                            graph(vec![Line::new(series, t.cpu)], 100.0, 0)
+                            graph(("core", i), vec![Line::new(series, t.cpu)], 100.0, 0)
                                 .h(px(30.))
                                 .w_full(),
                         )
                 }),
             ))
     }
-
-    fn render_interfaces(&self, s: &Snapshot) -> impl IntoElement {
-        let t = theme();
-        let cell = |w: f32| div().w(px(w)).flex().justify_end().flex_shrink_0();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_heading("Interfaces"))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(t.border)
-                    .overflow_hidden()
-                    .text_sm()
-                    .child(
-                        div()
-                            .flex()
-                            .px_3()
-                            .py_1p5()
-                            .bg(t.surface_raised)
-                            .text_xs()
-                            .text_color(t.text_muted)
-                            .child(div().flex_1().child("Name"))
-                            .child(cell(100.).child("Receive"))
-                            .child(cell(100.).child("Send"))
-                            .child(cell(110.).child("Total ↓ / ↑")),
-                    )
-                    .children(s.interfaces.iter().map(|i| {
-                        div()
-                            .flex()
-                            .px_3()
-                            .py_1p5()
-                            .border_t_1()
-                            .border_color(t.border)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_color(t.text)
-                                    .child(i.name.clone()),
-                            )
-                            .child(cell(100.).text_color(t.net_rx).child(format::rate(i.rx)))
-                            .child(cell(100.).text_color(t.net_tx).child(format::rate(i.tx)))
-                            .child(cell(110.).text_color(t.text_faint).text_xs().child(format!(
-                                "{} / {}",
-                                format::bytes(i.total_rx),
-                                format::bytes(i.total_tx)
-                            )))
-                    })),
-            )
-    }
 }
 
-/// Everything that differs between the resource detail views.
-struct Detail {
-    subtitle: SharedString,
-    lines: Vec<Line>,
-    max: f32,
-    scale_label: String,
-    legend: Vec<(&'static str, Rgba)>,
-    stats: Vec<(&'static str, String)>,
-    extra: Option<AnyElement>,
-}
-
-fn stat_tile(label: &str, value: String) -> impl IntoElement {
+fn render_interfaces(s: &Snapshot) -> impl IntoElement {
     let t = theme();
+    let cell = |w: f32| div().w(px(w)).flex().justify_end().flex_shrink_0();
     div()
         .flex()
         .flex_col()
-        .gap_0p5()
-        .min_w(px(120.))
+        .gap_2()
+        .child(section_heading("Interfaces"))
         .child(
             div()
-                .text_xs()
-                .text_color(t.text_faint)
-                .child(label.to_owned()),
+                .flex()
+                .flex_col()
+                .rounded_md()
+                .border_1()
+                .border_color(t.border)
+                .overflow_hidden()
+                .text_sm()
+                .child(
+                    div()
+                        .flex()
+                        .px_3()
+                        .py_1p5()
+                        .bg(t.surface_raised)
+                        .text_xs()
+                        .text_color(t.text_muted)
+                        .child(div().flex_1().child("Name"))
+                        .child(cell(100.).child("Receive"))
+                        .child(cell(100.).child("Send"))
+                        .child(cell(110.).child("Total ↓ / ↑")),
+                )
+                .children(s.interfaces.iter().map(|i| {
+                    div()
+                        .flex()
+                        .px_3()
+                        .py_1p5()
+                        .border_t_1()
+                        .border_color(t.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_color(t.text)
+                                .child(i.name.clone()),
+                        )
+                        .child(cell(100.).text_color(t.net_rx).child(format::rate(i.rx)))
+                        .child(cell(100.).text_color(t.net_tx).child(format::rate(i.tx)))
+                        .child(cell(110.).text_color(t.text_faint).text_xs().child(format!(
+                            "{} / {}",
+                            format::bytes(i.total_rx),
+                            format::bytes(i.total_tx)
+                        )))
+                })),
         )
-        .child(
-            div()
-                .text_lg()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(t.text)
-                .child(value),
-        )
-}
-
-fn section_heading(label: &'static str) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme().text_muted)
-        .child(label)
 }

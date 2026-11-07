@@ -38,7 +38,25 @@ Requires a recent stable Rust toolchain and the usual gpui Linux dependencies (V
 cargo run --release
 ```
 
-gpui is pulled from the Zed repository at a pinned commit (the crates.io release is outdated), so the first build downloads the Zed repo and takes a few minutes.
+gpui is pulled from the Zed repository at a pinned commit (the crates.io release is outdated), so the first build downloads the Zed repo and takes a few minutes. Dependencies are optimized even in debug builds, so plain `cargo run` stays smooth while the app itself remains quick to recompile.
+
+## Performance
+
+The UI is built to hold the display's full refresh rate (tested at 165 Hz) while
+scrolling and hovering:
+
+- Sampling and all text formatting happen on a background thread; the UI thread only draws.
+- Table rows are a single custom-painted element instead of nested layout boxes.
+- Graph paths are cached and rebuilt only when their data or size changes.
+
+To measure it on your machine, run the built-in frame benchmark with the window visible:
+
+```sh
+TASKMANAGER_BENCH=1 cargo run --release
+```
+
+It cycles through every view (including fast scrolling) and prints frame rate,
+frame-interval and per-frame CPU percentiles, plus dropped frames, for each.
 
 ## Notes
 
