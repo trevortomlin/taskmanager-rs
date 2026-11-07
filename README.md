@@ -2,6 +2,15 @@
 
 A fast, good-looking task manager for Linux, built in Rust with [gpui](https://gpui.rs) (Zed's GPU-accelerated UI framework).
 
+![Processes tab](docs/screenshots/processes.png)
+
+<details>
+<summary>Performance tab</summary>
+
+![Performance tab](docs/screenshots/performance.png)
+
+</details>
+
 ## Features
 
 - **Processes** — live, sortable, virtualized process table (name, PID, user, CPU, memory, disk) with heat-tinted cells for busy processes
