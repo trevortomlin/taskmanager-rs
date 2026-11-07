@@ -35,3 +35,7 @@ gpui is pulled from the Zed repository at a pinned commit (the crates.io release
 
 - Per-process network usage isn't shown: Linux only exposes it to privileged tools.
 - `src/text_input.rs` is adapted from gpui's `examples/input.rs` (Zed Industries, Apache-2.0).
+
+## License
+
+MIT — see [LICENSE](LICENSE). `src/text_input.rs` is derived from Apache-2.0 code from the Zed project; its notice is kept in that file.
