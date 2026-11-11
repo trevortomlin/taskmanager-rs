@@ -4891,17 +4891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "taskmanager-rs"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "gpui_platform",
- "rustix",
- "sysinfo 0.40.1",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "tauri-winrt-notification"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4972,6 +4961,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tidewatch"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+ "rustix",
+ "sysinfo 0.40.1",
+ "unicode-segmentation",
 ]
 
 [[package]]

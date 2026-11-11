@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Tidewatch
+GenericName=Task Manager
+Comment=Watch processes, CPU, memory, network and disk activity
+Exec=tidewatch
+Icon=tidewatch
+Terminal=false
+Categories=System;Monitor;
+Keywords=task;process;manager;monitor;cpu;memory;kill;
+StartupWMClass=tidewatch

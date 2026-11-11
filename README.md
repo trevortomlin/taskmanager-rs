@@ -1,6 +1,18 @@
-# taskmanager-rs
+<p align="center">
+  <img src="assets/app/tidewatch.svg" width="96" alt="Tidewatch icon">
+</p>
 
-A fast, good-looking task manager for Linux, built in Rust with [gpui](https://gpui.rs) (Zed's GPU-accelerated UI framework).
+<h1 align="center">Tidewatch</h1>
+
+<p align="center">
+  A fast, good-looking task manager for Linux.<br>
+  Written in Rust on <a href="https://github.com/trevortomlin/gpui-fast">GPUI Fast</a>.
+</p>
+
+Tidewatch keeps an eye on the ebb and flow of your system: processes, CPU, memory, network and
+disk. It's part of a family of fast Linux apps that share one look:
+[Rowscope](https://github.com/trevortomlin/rowscope) (spreadsheets),
+[Quarry](https://github.com/trevortomlin/quarry) (disk usage) and Warren (file manager).
 
 ![Processes tab](docs/screenshots/processes.png)
 
@@ -32,13 +44,22 @@ A fast, good-looking task manager for Linux, built in Rust with [gpui](https://g
 
 ## Building
 
-Requires a recent stable Rust toolchain and the usual gpui Linux dependencies (Vulkan, Wayland and/or X11, xkbcommon, fontconfig).
+Requires a recent stable Rust toolchain and the usual GPUI Linux dependencies (Vulkan, Wayland and/or X11, xkbcommon, fontconfig).
 
 ```sh
-cargo run --release
+cargo build --release
+./target/release/tidewatch
 ```
 
-gpui is pulled from the Zed repository at a pinned commit (the crates.io release is outdated), so the first build downloads the Zed repo and takes a few minutes. Dependencies are optimized even in debug builds, so plain `cargo run` stays smooth while the app itself remains quick to recompile.
+GPUI Fast is pulled from [its repository](https://github.com/trevortomlin/gpui-fast) at a pinned commit, so the first build takes a few minutes. Dependencies are optimized even in debug builds, so plain `cargo run` stays smooth while the app itself remains quick to recompile.
+
+To add it to your application menu:
+
+```sh
+install -Dm755 target/release/tidewatch ~/.local/bin/tidewatch
+install -Dm644 tidewatch.desktop ~/.local/share/applications/tidewatch.desktop
+install -Dm644 assets/app/tidewatch.svg ~/.local/share/icons/hicolor/scalable/apps/tidewatch.svg
+```
 
 ## Performance
 
@@ -52,7 +73,7 @@ scrolling and hovering:
 To measure it on your machine, run the built-in frame benchmark with the window visible:
 
 ```sh
-TASKMANAGER_BENCH=1 cargo run --release
+TIDEWATCH_BENCH=1 cargo run --release
 ```
 
 It cycles through every view (including fast scrolling) and prints frame rate,

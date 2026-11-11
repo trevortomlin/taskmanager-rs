@@ -1,5 +1,6 @@
 [package]
-name = "taskmanager-rs"
+name = "tidewatch"
+description = "Tidewatch: a fast, good-looking task manager for Linux, built on GPUI Fast"
 version = "0.1.0"
 license = "MIT"
 edition = "2024"
