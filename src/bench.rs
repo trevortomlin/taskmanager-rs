@@ -1,6 +1,6 @@
 //! Opt-in frame benchmark, used to check the UI keeps up with high-refresh displays.
 //!
-//! Run with `TASKMANAGER_BENCH=1 cargo run --release`. The app redraws every frame,
+//! Run with `TIDEWATCH_BENCH=1 cargo run --release`. The app redraws every frame,
 //! cycles through each view (including continuous scrolling), prints frame
 //! statistics per view to stderr, then exits. Keep the window visible while it
 //! runs: compositors stop delivering frames to hidden windows.
@@ -71,7 +71,7 @@ pub struct BenchFrame {
 
 impl Bench {
     pub fn from_env() -> Option<Self> {
-        std::env::var_os("TASKMANAGER_BENCH")?;
+        std::env::var_os("TIDEWATCH_BENCH")?;
         Some(Self {
             started: Instant::now(),
             phase_ix: 0,

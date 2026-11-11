@@ -25,10 +25,10 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Task Manager".into()),
+                    title: Some("Tidewatch".into()),
                     ..Default::default()
                 }),
-                app_id: Some("taskmanager-rs".into()),
+                app_id: Some("tidewatch".into()),
                 window_min_size: Some(size(px(720.0), px(480.0))),
                 ..Default::default()
             },

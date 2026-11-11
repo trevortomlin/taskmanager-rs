@@ -300,7 +300,7 @@ impl TaskManager {
                             .text_xl()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(t.text)
-                            .child("Task Manager"),
+                            .child("Tidewatch"),
                     )
                     .child(div().text_sm().text_color(t.text_faint).child(subtitle)),
             )
